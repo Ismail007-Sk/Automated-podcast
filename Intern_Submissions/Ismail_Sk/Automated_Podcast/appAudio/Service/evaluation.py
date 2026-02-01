@@ -17,10 +17,10 @@ SEGp = os.path.join(BASE, "T_segmentation")
 
 # ---------------- FILES ----------------
 GT_TXT = f"{TRANSa}/ground_truth.txt"
-PRED_TXT = f"{TRANSp}/7fe83b66-6a26-4115-bcbb-49318afde128_Bill_Gates_Podcast(128k)_processed.txt"
+PRED_TXT = f"{TRANSp}/9cb4da1a-9c9a-448b-a1d0-d17575a8aa10_How_to_Build_Extreme_Willpower___David_Goggins___Dr._Andrew_Huberman(256k)_processed.txt"
 
 GT_TOPIC = f"{SEGa}/ground_truth_topics.txt"
-PRED_TOPIC = f"{SEGp}/7fe83b66-6a26-4115-bcbb-49318afde128_Bill_Gates_Podcast(128k)_processed_topics.txt"
+PRED_TOPIC = f"{SEGp}/9cb4da1a-9c9a-448b-a1d0-d17575a8aa10_How_to_Build_Extreme_Wi_topics.txt"
 
 # ---------------- UTILS ----------------
 def read_text(path):
@@ -58,7 +58,7 @@ def topic_segmentation_logic():
 
     return {
         "Topic_Coherence": round(float(np.mean(sim)), 3),
-        "Boundary_Accuracy": round(float(np.mean(sim > 0.6)), 3),
+        "Semantic_Boundary_Alignment": round(float(np.mean(sim > 0.6)), 3),
         "Total_Predicted_Topics": len(pred)
     }
 
@@ -68,8 +68,8 @@ def topic_segmentation_logic():
 def genai_usage():
     return {
         "ASR_Model": "Whisper Small",
-        "LLM_Model": "Meta-LLaMA-3.1-8B-Instruct (GGUF)",
-        "Usage": "Transcription + Human-like topic titles"
+        "LLM_Model": "Groq API (llama-3.3-70b-versatile)",
+        "Usage": "ASR output evaluation + Topic title generation"
     }
 
 # =========================================================
@@ -77,9 +77,9 @@ def genai_usage():
 # =========================================================
 def safety_handling():
     return {
-        "Execution_Mode": "Fully Local",
+        "Execution_Mode": "Hybrid (Local + Cloud)",
         "User_Data_Stored": False,
-        "Cloud_API_Used": False
+        "Cloud_API_Used": "Groq API"
     }
 
 # =========================================================
@@ -89,7 +89,7 @@ def cost_awareness():
     return {
         "Model_Choice": "Whisper Small",
         "Reason": "Low GPU usage, zero API cost",
-        "Inference_Cost": "Minimal"
+        "Inference_Cost": "Low (ASR local) + API-based (LLM)"
     }
 
 # =========================================================

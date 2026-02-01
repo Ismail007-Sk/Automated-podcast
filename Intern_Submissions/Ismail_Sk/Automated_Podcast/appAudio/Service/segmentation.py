@@ -1,33 +1,49 @@
 """
 Hybrid Unsupervised Semantic Topic Segmentation
 with LLaMA-assisted Human-like Chapter Generation
+
+✔ Windows-safe
+✔ Django-safe
+✔ Filename-safe
+✔ Production-ready
 """
+
+# =========================================================
+# IMPORTS
+# =========================================================
 
 from pathlib import Path
 import json
 import re
+import os
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from llama_cpp import Llama
+from groq import Groq
+from dotenv import load_dotenv
 
 # =========================================================
-# PATH CONFIGURATION
+# PATH CONFIGURATION (ABSOLUTE, NEVER BREAKS)
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
 TRANSCRIPT_DIR = BASE_DIR / "appAudio" / "Service" / "Output" / "Transcription"
 SEGMENT_DIR = BASE_DIR / "appAudio" / "Service" / "Output" / "T_segmentation"
-MODEL_PATH = BASE_DIR / "models" / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 
 SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================================================
-# MODELS (Lazy Loaded)
+# ENV & GROQ CLIENT
+# =========================================================
+
+load_dotenv()
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# =========================================================
+# EMBEDDING MODEL (LAZY LOADING)
 # =========================================================
 
 _embedder = None
-_llm = None
 
 
 def get_embedder():
@@ -37,49 +53,35 @@ def get_embedder():
     return _embedder
 
 
-def get_llm():
-    global _llm
-    if _llm is None:
-        _llm = Llama(
-            model_path=str(MODEL_PATH),
-            n_ctx=2048,
-            n_gpu_layers=8,
-            temperature=0.3,
-            verbose=False
-        )
-    return _llm
-
-
 # =========================================================
-# UTILS
+# UTILITY FUNCTIONS
 # =========================================================
 
-def sec_to_mmss(seconds):
+def sec_to_mmss(seconds: float) -> str:
     m = int(seconds // 60)
     s = int(seconds % 60)
     return f"{m:02d}:{s:02d}"
 
-# I use SentenceTransformer embeddings. 
-# These models work best on raw, natural text. 
-# Over-cleaning (stopwords, stemming) hurts semantic similarity. 
-# LLaMA title generation also needs natural language context
-#👉 So minimal preprocessing is a deliberate, good choice.
-#Extra preprocessing (stopwords removal, stemming, heavy cleaning):
-#❌ Removes context
-#❌ Breaks meaning
-#❌ Reduces semantic similarity quality
 
-def clean_text(text):
+def clean_text(text: str) -> str:
+    """Minimal cleaning (best for embeddings)"""
     return re.sub(r"\s+", " ", text).strip()
 
 
+def safe_stem(name: str, max_len: int = 60) -> str:
+    """
+    Fully Windows-safe filename:
+    - removes unsafe characters
+    - limits length
+    """
+    return "".join(c for c in name if c.isalnum() or c in "_-")[:max_len]
+
+
 # =========================================================
-# LLaMA TITLE GENERATION
+# LLaMA TITLE GENERATION (GROQ)
 # =========================================================
 
-def generate_llama_title(text):
-    llm = get_llm()
-
+def generate_llama_title(text: str) -> str:
     prompt = f"""
 Create a short podcast chapter title.
 
@@ -94,28 +96,37 @@ Text:
 Title:
 """
 
-    response = llm(prompt, max_tokens=16, stop=["\n"])
-    title = response["choices"][0]["text"].strip()
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=16,
+        temperature=0.3,
+    )
+
+    title = response.choices[0].message.content.strip()
     return title if title else "General Discussion"
 
 
 # =========================================================
-# CORE SEGMENTATION
+# CORE SEGMENTATION FUNCTION
 # =========================================================
 
-def segment_whisper_file(json_file: Path):
+def segment_whisper_file(json_file: Path) -> Path:
+    """
+    Segments a Whisper JSON transcript.
+    RETURNS the actual output file path (IMPORTANT for Django).
+    """
+
+    json_file = Path(json_file)
+
     with open(json_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     segments = data.get("segments", [])
     if len(segments) < 2:
-        return
+        raise ValueError("Not enough segments for topic segmentation")
 
-    #✔ Removes extra spaces, line breaks
-    #✔ Makes text cleaner for embeddings
-    #✔ Trims edges
     texts = [clean_text(s["text"]) for s in segments]
-
     starts = [s["start"] for s in segments]
     ends = [s["end"] for s in segments]
 
@@ -123,6 +134,9 @@ def segment_whisper_file(json_file: Path):
     embeddings = embedder.encode(texts)
 
     SIM_THRESHOLD = 0.55
+    MIN_SEG_SIZE = 5
+    MIN_GAP_SEC = 80
+
     blocks = []
     block_start = 0
     current_emb = embeddings[0]
@@ -133,7 +147,7 @@ def segment_whisper_file(json_file: Path):
             embeddings[i].reshape(1, -1)
         )[0][0]
 
-        if sim < SIM_THRESHOLD and i - block_start >= 5:
+        if sim < SIM_THRESHOLD and i - block_start >= MIN_SEG_SIZE:
             blocks.append((block_start, i - 1))
             block_start = i
             current_emb = embeddings[i]
@@ -142,24 +156,19 @@ def segment_whisper_file(json_file: Path):
 
     blocks.append((block_start, len(texts) - 1))
 
-    out_file = SEGMENT_DIR / f"{json_file.stem}_topics.txt"
+    # =====================================================
+    # SAFE OUTPUT FILE (NO GUESSING)
+    # =====================================================
 
-    # with open(out_file, "w", encoding="utf-8") as f:
-    #     f.write("00:00 - Introduction\n")
-    #     for s, e in blocks:
-    #         if starts[s] < 10:
-    #             continue
-    #         title = generate_llama_title(" ".join(texts[s:s+5]))
-    #         f.write(f"{sec_to_mmss(starts[s])} - {title}\n")
-    #     f.write(f"{sec_to_mmss(ends[-1])} - Conclusion\n")
-
+    safe_name = safe_stem(json_file.stem)
+    out_file = SEGMENT_DIR / f"{safe_name}_topics.txt"
 
     with open(out_file, "w", encoding="utf-8") as f:
         f.write("00:00 - Introduction\n")
-        MIN_GAP_SEC = 80  # 1.2 minutes
+
         last_written_time = 0
 
-        for s, e in blocks:
+        for s, _ in blocks:
             start_sec = starts[s]
 
             if start_sec < 10:
@@ -168,34 +177,36 @@ def segment_whisper_file(json_file: Path):
             if start_sec - last_written_time < MIN_GAP_SEC:
                 continue
 
-            title = generate_llama_title(" ".join(texts[s:s+5]))
-            f.write(f"{sec_to_mmss(start_sec)} - {title}\n")
+            context = " ".join(texts[s:s + 5])
+            title = generate_llama_title(context)
 
+            f.write(f"{sec_to_mmss(start_sec)} - {title}\n")
             last_written_time = start_sec
 
         f.write(f"{sec_to_mmss(ends[-1])} - Conclusion\n")
 
+    return out_file  # 🔥 THIS IS THE KEY FIX
+
 
 # =========================================================
-# DJANGO PIPELINE WRAPPER  ✅ IMPORTANT
+# DJANGO PIPELINE ENTRY (USE THIS ONLY)
 # =========================================================
 
-def segment_from_json(json_path):
+def segment_from_json(json_path) -> Path:
     """
-    Used by Django pipeline.
-    Accepts string or Path.
+    Django-safe wrapper.
+    Always returns the REAL output file path.
     """
-    json_path = Path(json_path)
-    segment_whisper_file(json_path)
+    return segment_whisper_file(Path(json_path))
 
 
 # =========================================================
-# BATCH MODE
+# BATCH MODE (OPTIONAL)
 # =========================================================
 
 def segment_all():
-    for file in TRANSCRIPT_DIR.glob("*.json"):
-        segment_whisper_file(file)
+    for json_file in TRANSCRIPT_DIR.glob("*.json"):
+        segment_whisper_file(json_file)
 
 
 if __name__ == "__main__":

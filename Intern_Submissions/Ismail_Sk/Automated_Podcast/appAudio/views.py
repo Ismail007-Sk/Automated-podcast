@@ -1,69 +1,76 @@
 from django.shortcuts import render
 from django.conf import settings
-import os, uuid, shutil, time, threading
+from django.http import JsonResponse
+
+import os
+import uuid
+import shutil
+import time
+import threading
+from pathlib import Path
+import json
 
 from .Service.preprocessing import preprocess_audio
 from .Service.transcription import transcribe_audio
 from .Service.segmentation import segment_from_json
+from .Service.question import answer_from_transcript
 
 
-# --------------------------------------------------
-# Base paths
-# --------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ==================================================
+# BASE PATHS (ABSOLUTE, SAFE)
+# ==================================================
 
-RAW_DIR = os.path.join(BASE_DIR, "appAudio", "Service", "Dataset", "Raw")
-PREPROCESS_DIR = os.path.join(BASE_DIR, "appAudio", "Service", "Dataset", "Preprocessed")
-TRANS_DIR = os.path.join(BASE_DIR, "appAudio", "Service", "Output", "Transcription")
-SEG_DIR = os.path.join(BASE_DIR, "appAudio", "Service", "Output", "T_segmentation")
+BASE_DIR = Path(__file__).resolve().parents[1]
 
-MEDIA_TRANS = os.path.join(settings.MEDIA_ROOT, "transcription")
-MEDIA_SEG = os.path.join(settings.MEDIA_ROOT, "segmentation")
+RAW_DIR = BASE_DIR / "appAudio" / "Service" / "Dataset" / "Raw"
+PREPROCESS_DIR = BASE_DIR / "appAudio" / "Service" / "Dataset" / "Preprocessed"
+TRANS_DIR = BASE_DIR / "appAudio" / "Service" / "Output" / "Transcription"
+SEG_DIR = BASE_DIR / "appAudio" / "Service" / "Output" / "T_segmentation"
 
-os.makedirs(RAW_DIR, exist_ok=True)
-os.makedirs(MEDIA_TRANS, exist_ok=True)
-os.makedirs(MEDIA_SEG, exist_ok=True)
+MEDIA_TRANS = Path(settings.MEDIA_ROOT) / "transcription"
+MEDIA_SEG = Path(settings.MEDIA_ROOT) / "segmentation"
+
+for d in [RAW_DIR, PREPROCESS_DIR, TRANS_DIR, SEG_DIR, MEDIA_TRANS, MEDIA_SEG]:
+    d.mkdir(parents=True, exist_ok=True)
 
 
-# --------------------------------------------------
-# Auto-clean helpers
-# --------------------------------------------------
-def clean_old_files(folder):
-    """Delete all files inside a folder"""
-    if not os.path.exists(folder):
+# ==================================================
+# CLEANUP HELPERS
+# ==================================================
+
+def clean_old_files(folder: Path):
+    if not folder.exists():
         return
-
-    for f in os.listdir(folder):
-        path = os.path.join(folder, f)
-        if os.path.isfile(path):
-            os.remove(path)
+    for f in folder.iterdir():
+        if f.is_file():
+            f.unlink()
 
 
-def delete_later(path, delay=300):
-    """Delete a file after delay (seconds)"""
+def delete_later(path: Path, delay=300):
     def _delete():
         time.sleep(delay)
-        if os.path.exists(path):
-            os.remove(path)
+        if path.exists():
+            path.unlink()
     threading.Thread(target=_delete, daemon=True).start()
 
 
-# --------------------------------------------------
-# Main view
-# --------------------------------------------------
+# ==================================================
+# MAIN VIEW
+# ==================================================
+
 def upload_audio(request):
     context = {}
 
     if request.method == "POST":
         action = request.POST.get("action")
 
-        # ---------- CANCEL ----------
+        # ---------------- CANCEL ----------------
         if action == "cancel":
             return render(request, "upload.html", {
                 "status": "❌ Cancelled by user"
             })
 
-        # ---------- UPLOAD ----------
+        # ---------------- UPLOAD ----------------
         if action == "upload":
             audio_file = request.FILES.get("audio")
             if not audio_file:
@@ -71,14 +78,14 @@ def upload_audio(request):
                     "status": "No file selected"
                 })
 
-            # 🔥 AUTO DELETE OLD RAW AUDIO
+            # cleanup old files
             clean_old_files(RAW_DIR)
             clean_old_files(PREPROCESS_DIR)
             clean_old_files(TRANS_DIR)
             clean_old_files(SEG_DIR)
 
             filename = f"{uuid.uuid4()}_{audio_file.name}"
-            file_path = os.path.join(RAW_DIR, filename)
+            file_path = RAW_DIR / filename
 
             with open(file_path, "wb+") as f:
                 for chunk in audio_file.chunks():
@@ -89,48 +96,47 @@ def upload_audio(request):
                 "uploaded_file": filename
             })
 
-        # ---------- PROCESS ----------
+        # ---------------- PROCESS ----------------
         if action == "process":
             start_time = time.time()
 
             uploaded_file = request.POST.get("uploaded_file")
-            file_path = os.path.join(RAW_DIR, uploaded_file)
+            raw_audio_path = RAW_DIR / uploaded_file
 
-            # preprocessing → transcription → segmentation
-            clean_audio = preprocess_audio(file_path)
-            json_path = transcribe_audio(clean_audio)
-            segment_from_json(json_path)
+            # ---- PIPELINE ----
+            clean_audio_path = preprocess_audio(raw_audio_path)
+            json_path = transcribe_audio(clean_audio_path)
 
-            # output files
-            txt_file = os.path.basename(json_path).replace(".json", ".txt")
-            seg_file = os.path.basename(json_path).replace(".json", "_topics.txt")
+            # 🔥 IMPORTANT: USE RETURNED PATH
+            seg_path = segment_from_json(json_path)
 
-            trans_src = os.path.join(TRANS_DIR, txt_file)
-            seg_src = os.path.join(SEG_DIR, seg_file)
+            # transcription txt
+            txt_path = TRANS_DIR / (Path(json_path).stem + ".txt")
 
-            trans_dst = os.path.join(MEDIA_TRANS, txt_file)
-            seg_dst = os.path.join(MEDIA_SEG, seg_file)
+            # ---- COPY TO MEDIA ----
+            trans_dst = MEDIA_TRANS / txt_path.name
+            seg_dst = MEDIA_SEG / seg_path.name
 
-            shutil.copy(trans_src, trans_dst)
-            shutil.copy(seg_src, seg_dst)
+            shutil.copy(txt_path, trans_dst)
+            shutil.copy(seg_path, seg_dst)
 
-            # file sizes
-            txt_size = os.path.getsize(trans_dst) // 1024
-            seg_size = os.path.getsize(seg_dst) // 1024
+            # sizes
+            txt_size = trans_dst.stat().st_size // 1024
+            seg_size = seg_dst.stat().st_size // 1024
 
-            # ⏱ auto delete downloadable files
-            delete_later(trans_dst, delay=300)
-            delete_later(seg_dst, delay=300)
+            # auto delete downloads
+            delete_later(trans_dst, delay=1000)
+            delete_later(seg_dst, delay=1000)
 
-            # 🧹 immediate cleanup of raw audio
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            # cleanup raw audio
+            if raw_audio_path.exists():
+                raw_audio_path.unlink()
 
             context.update({
                 "status": "✅ Processing completed",
                 "uploaded_file": uploaded_file,
-                "transcription_file": f"{settings.MEDIA_URL}transcription/{txt_file}",
-                "segmentation_file": f"{settings.MEDIA_URL}segmentation/{seg_file}",
+                "transcription_file": f"{settings.MEDIA_URL}transcription/{trans_dst.name}",
+                "segmentation_file": f"{settings.MEDIA_URL}segmentation/{seg_dst.name}",
                 "txt_size": txt_size,
                 "seg_size": seg_size,
                 "time_taken": round(time.time() - start_time, 2),
@@ -141,5 +147,25 @@ def upload_audio(request):
 
     return render(request, "upload.html")
 
+
+# ==================================================
+# HOME
+# ==================================================
+
 def home(request):
     return render(request, "home.html")
+
+
+# ==================================================
+# CHAT / Q&A
+# ==================================================
+
+def chat_from_transcript(request):
+    if request.method != "POST":
+        return JsonResponse({"answer": "Invalid request"})
+
+    data = json.loads(request.body)
+    question = data.get("question", "").strip()
+
+    answer = answer_from_transcript(question)
+    return JsonResponse({"answer": answer})
